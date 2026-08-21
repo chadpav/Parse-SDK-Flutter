@@ -47,6 +47,12 @@ class ParseUser extends ParseObject implements ParseCloneable {
 
   String? _password;
 
+  /// Marks an instance whose next successful response must be persisted as
+  /// the current user even though it cannot be matched against storage yet
+  /// (e.g. [getCurrentUserFromServer], which starts from an empty user and
+  /// only learns its objectId from the response).
+  bool _persistAsCurrentUser = false;
+
   String? get password => _password;
 
   set password(String? password) {
@@ -118,6 +124,7 @@ class ParseUser extends ParseObject implements ParseCloneable {
   }) async {
     final ParseUser user = _getEmptyUser();
     user.sessionToken = token;
+    user._persistAsCurrentUser = true;
     return user.getUpdatedUser(debug: debug, client: client);
   }
 
@@ -492,7 +499,9 @@ class ParseUser extends ParseObject implements ParseCloneable {
       if (response.success) {
         _adoptResponseSessionTokenIfChanged(tokenBefore);
         _cleanUpAuthData();
-        await _onResponseSuccess();
+        if (await _isCurrentUser()) {
+          await _onResponseSuccess();
+        }
       }
       return response;
     }
@@ -508,7 +517,9 @@ class ParseUser extends ParseObject implements ParseCloneable {
       if (response.success) {
         _adoptResponseSessionTokenIfChanged(tokenBefore);
         _cleanUpAuthData();
-        await _onResponseSuccess();
+        if (await _isCurrentUser()) {
+          await _onResponseSuccess();
+        }
       }
       return response;
     }
@@ -530,6 +541,40 @@ class ParseUser extends ParseObject implements ParseCloneable {
   Future<void> _onResponseSuccess() async {
     await saveInStorage(keyParseStoreUser);
   }
+
+  /// Whether this instance is the current user stored in local storage.
+  ///
+  /// Mirrors the JS SDK's `isCurrentAsync()`: reads the user persisted under
+  /// [keyParseStoreUser] and compares its `objectId` with this instance's.
+  /// Without this gate, whichever [ParseUser] instance happens to handle a
+  /// response would overwrite the current-user storage — e.g. a stale
+  /// anonymous instance's fetch resolving after a login would clobber the
+  /// freshly logged-in user on disk.
+  Future<bool> _isCurrentUser() async {
+    if (objectId == null) {
+      return false;
+    }
+    final CoreStore coreStore = ParseCoreData().getStore();
+    final String? userJson = await coreStore.getString(keyParseStoreUser);
+    if (userJson == null) {
+      return false;
+    }
+    try {
+      final Map<String, dynamic> userMap = json.decode(userJson);
+      return userMap[keyVarObjectId] == objectId;
+    } on FormatException {
+      return false;
+    }
+  }
+
+  /// Request types that establish a new current user and therefore always
+  /// persist to local storage, mirroring the JS SDK where only login/signup
+  /// flows call `_handleSaveResult(true)` to make a user current.
+  static bool _establishesCurrentUser(ParseApiRQ type) =>
+      type == ParseApiRQ.login ||
+      type == ParseApiRQ.loginAnonymous ||
+      type == ParseApiRQ.signUp ||
+      type == ParseApiRQ.loginWith;
 
   void _stripAnonymity() {
     final Map<String, dynamic>? authData =
@@ -673,7 +718,11 @@ class ParseUser extends ParseObject implements ParseCloneable {
       return parseResponse;
     } else {
       final ParseUser user = parseResponse.result;
-      await user._onResponseSuccess();
+      if (_establishesCurrentUser(type) ||
+          user._persistAsCurrentUser ||
+          await user._isCurrentUser()) {
+        await user._onResponseSuccess();
+      }
       return parseResponse;
     }
   }
