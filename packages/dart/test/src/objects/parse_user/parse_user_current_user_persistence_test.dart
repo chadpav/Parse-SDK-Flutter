@@ -381,5 +381,36 @@ void main() {
       expect(ParseCoreData().sessionId, equals('r:mintedSession'));
       expect(await storedUserObjectId(), equals(currentUserObjectId));
     });
+
+    test('a corrupt stored current-user blob is treated as no current user — '
+        'the responding instance must not persist over it (FormatException '
+        'branch of the current-user gate)', () async {
+      const String corruptBlob = 'not-valid-json{{{';
+      await ParseCoreData().getStore().setString(
+        keyParseStoreUser,
+        corruptBlob,
+      );
+
+      when(client.get(mePath, options: anyNamed('options'))).thenAnswer(
+        (_) async => ParseNetworkResponse(
+          statusCode: 200,
+          data: jsonEncode(<String, dynamic>{
+            keyVarObjectId: detachedUserObjectId,
+            keyVarUsername: 'anonymous-uuid',
+            keyVarSessionToken: 'r:staleAnonSession',
+          }),
+        ),
+      );
+
+      final ParseResponse response = await detachedUser().getUpdatedUser(
+        client: client,
+      );
+
+      expect(response.success, isTrue);
+      expect(
+        await ParseCoreData().getStore().getString(keyParseStoreUser),
+        equals(corruptBlob),
+      );
+    });
   });
 }
