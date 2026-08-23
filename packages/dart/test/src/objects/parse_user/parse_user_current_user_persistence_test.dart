@@ -354,7 +354,7 @@ void main() {
         'from the response (_adoptResponseSessionTokenIfChanged behavior is '
         'preserved) even though it no longer persists to storage', () async {
       await seedCurrentUserInStorage();
-      ParseCoreData().setSessionId('r:staleAnonSession');
+      ParseCoreData().setSessionId('r:currentSession');
 
       when(
         client.put(
@@ -373,6 +373,46 @@ void main() {
       );
 
       final ParseUser user = detachedUser();
+      user.password = 'newPassword';
+
+      final ParseResponse response = await user.save();
+
+      // The detached instance must adopt NEITHER the storage slot NOR the
+      // global session — otherwise storage and session would belong to two
+      // different accounts.
+      expect(response.success, isTrue);
+      expect(ParseCoreData().sessionId, equals('r:currentSession'));
+      expect(await storedUserObjectId(), equals(currentUserObjectId));
+    });
+
+    test('save() on the current user that mints a fresh sessionToken still '
+        'adopts it — the anonymous-to-password upgrade flow depends on '
+        'this (the current instance IS the stored user)', () async {
+      await seedCurrentUserInStorage();
+      ParseCoreData().setSessionId('r:currentSession');
+
+      when(
+        client.put(
+          currentPutPath,
+          options: anyNamed('options'),
+          data: anyNamed('data'),
+        ),
+      ).thenAnswer(
+        (_) async => ParseNetworkResponse(
+          statusCode: 200,
+          data: jsonEncode(<String, dynamic>{
+            keyVarUpdatedAt: '2026-08-19T12:00:01.000Z',
+            keyVarSessionToken: 'r:mintedSession',
+          }),
+        ),
+      );
+
+      final ParseUser user = ParseUser(null, null, null, client: client);
+      user.fromJson(<String, dynamic>{
+        keyVarObjectId: currentUserObjectId,
+        keyVarSessionToken: 'r:currentSession',
+        keyVarUsername: 'alice@example.com',
+      });
       user.password = 'newPassword';
 
       final ParseResponse response = await user.save();
@@ -412,5 +452,40 @@ void main() {
         equals(corruptBlob),
       );
     });
+
+    for (final String nonObjectRoot in <String>['null', '[]', '"user"']) {
+      test(
+        'a stored blob of valid JSON with a non-object root ($nonObjectRoot) '
+        'is treated as no current user — the type check must catch what '
+        'the FormatException handler cannot',
+        () async {
+          await ParseCoreData().getStore().setString(
+            keyParseStoreUser,
+            nonObjectRoot,
+          );
+
+          when(client.get(mePath, options: anyNamed('options'))).thenAnswer(
+            (_) async => ParseNetworkResponse(
+              statusCode: 200,
+              data: jsonEncode(<String, dynamic>{
+                keyVarObjectId: detachedUserObjectId,
+                keyVarUsername: 'anonymous-uuid',
+                keyVarSessionToken: 'r:staleAnonSession',
+              }),
+            ),
+          );
+
+          final ParseResponse response = await detachedUser().getUpdatedUser(
+            client: client,
+          );
+
+          expect(response.success, isTrue);
+          expect(
+            await ParseCoreData().getStore().getString(keyParseStoreUser),
+            equals(nonObjectRoot),
+          );
+        },
+      );
+    }
   });
 }

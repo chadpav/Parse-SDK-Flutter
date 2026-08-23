@@ -20,9 +20,20 @@ void main() {
       '$serverUrl$keyEndPointClasses$keyClassUser/$userObjectId',
     ).toString();
 
-    setUp(() {
+    setUp(() async {
       client = MockParseClient();
+      await ParseCoreData().getStore().remove(keyParseStoreUser);
     });
+
+    /// Token adoption is gated on the saving instance being the stored
+    /// current user (persist-only-current-user). These scenarios model the
+    /// current user changing their own password, so storage must hold them.
+    Future<void> seedAsStoredCurrentUser(ParseUser user) async {
+      await ParseCoreData().getStore().setString(
+        keyParseStoreUser,
+        json.encode(user.toJson(full: true)),
+      );
+    }
 
     test('when a save() response carries a sessionToken different from the '
         'one sent, the SDK installs it as the global session token. Parse '
@@ -55,6 +66,7 @@ void main() {
         ),
       );
 
+      await seedAsStoredCurrentUser(user);
       user.password = 'hunter2';
 
       final ParseResponse response = await user.save();
@@ -125,6 +137,7 @@ void main() {
         ),
       );
 
+      await seedAsStoredCurrentUser(user);
       user.password = 'hunter2';
 
       final ParseResponse response = await user.update();

@@ -497,9 +497,13 @@ class ParseUser extends ParseObject implements ParseCloneable {
       final String? tokenBefore = sessionToken;
       final ParseResponse response = await super.save();
       if (response.success) {
-        _adoptResponseSessionTokenIfChanged(tokenBefore);
         _cleanUpAuthData();
+        // Adopt the response session token only for the current user — a
+        // detached instance's freshly-minted token must not replace the
+        // global session, or storage and session would belong to two
+        // different accounts.
         if (await _isCurrentUser()) {
+          _adoptResponseSessionTokenIfChanged(tokenBefore);
           await _onResponseSuccess();
         }
       }
@@ -515,9 +519,11 @@ class ParseUser extends ParseObject implements ParseCloneable {
       final String? tokenBefore = sessionToken;
       final ParseResponse response = await super.update();
       if (response.success) {
-        _adoptResponseSessionTokenIfChanged(tokenBefore);
         _cleanUpAuthData();
+        // Same ordering as save(): token adoption is gated on the instance
+        // being the stored current user.
         if (await _isCurrentUser()) {
+          _adoptResponseSessionTokenIfChanged(tokenBefore);
           await _onResponseSuccess();
         }
       }
@@ -560,8 +566,13 @@ class ParseUser extends ParseObject implements ParseCloneable {
       return false;
     }
     try {
-      final Map<String, dynamic> userMap = json.decode(userJson);
-      return userMap[keyVarObjectId] == objectId;
+      final dynamic decoded = json.decode(userJson);
+      // A valid-JSON root that is not an object (null, list, string) is as
+      // corrupt as unparseable JSON for our purposes: no current user.
+      if (decoded is! Map<String, dynamic>) {
+        return false;
+      }
+      return decoded[keyVarObjectId] == objectId;
     } on FormatException {
       return false;
     }
