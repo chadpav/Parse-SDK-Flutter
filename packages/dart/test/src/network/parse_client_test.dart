@@ -114,6 +114,29 @@ void main() {
       },
     );
 
+    test(
+      'treats a caller-supplied installation-id header as present regardless '
+      'of casing. HTTP header names are case-insensitive; a lower-case '
+      'caller header must not gain a second, differently-cased entry',
+      () async {
+        final Map<String, String>? headers = await client.exposedBuildHeaders(
+          ParseNetworkOptions(
+            headers: <String, String>{'x-parse-installation-id': 'caller-id'},
+          ),
+        );
+
+        expect(headers!['x-parse-installation-id'], equals('caller-id'));
+        expect(
+          headers.keys.where(
+            (String name) =>
+                name.toLowerCase() == keyHeaderInstallationId.toLowerCase(),
+          ),
+          hasLength(1),
+          reason: 'no duplicate installation-id entry may be added',
+        );
+      },
+    );
+
     test('merges caller-supplied headers with the install ID. Custom headers '
         'and the auto-attached install ID must coexist — neither side '
         'overrides the other', () async {

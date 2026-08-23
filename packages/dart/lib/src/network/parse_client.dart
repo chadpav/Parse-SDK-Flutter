@@ -80,7 +80,15 @@ abstract class ParseClient {
     ParseNetworkOptions? options,
   ) async {
     if (options?.sendInstallationId == false) return options?.headers;
-    if (options?.headers?[keyHeaderInstallationId] != null) {
+    // HTTP header names are case-insensitive (RFC 9110): a caller-supplied
+    // installation-id header in any casing counts as already present, or a
+    // second differently-cased entry would ride along.
+    final String installationIdHeaderLower = keyHeaderInstallationId
+        .toLowerCase();
+    if (options?.headers?.keys.any(
+          (String name) => name.toLowerCase() == installationIdHeaderLower,
+        ) ??
+        false) {
       return options?.headers;
     }
     String? installationId;
