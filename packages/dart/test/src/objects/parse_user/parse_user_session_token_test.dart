@@ -80,12 +80,17 @@ void main() {
         'on the user object must not be re-promoted to global state', () async {
       ParseCoreData().setSessionId('r:stableSession');
 
+      // The cached local token deliberately differs from the global one so
+      // an incorrect re-promotion would be observable, and the user is
+      // seeded as the stored current user so the save actually reaches the
+      // adoption code path inside the current-user gate.
       final ParseUser user = ParseUser(null, null, null, client: client);
       user.fromJson(<String, dynamic>{
         keyVarObjectId: userObjectId,
-        keyVarSessionToken: 'r:stableSession',
+        keyVarSessionToken: 'r:cachedSession',
         keyVarUsername: 'alice@example.com',
       });
+      await seedAsStoredCurrentUser(user);
 
       when(
         client.put(
