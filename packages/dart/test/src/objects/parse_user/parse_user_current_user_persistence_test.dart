@@ -546,7 +546,14 @@ void main() {
 
       holdingStore.arm();
       final Future<ParseResponse> saveFuture = userA.save();
+      int pumps = 0;
       while (!holdingStore.isHolding) {
+        if (++pumps > 1000) {
+          fail(
+            'save() never reached the current-user read; the persistence '
+            'gate did not call getString(keyParseStoreUser).',
+          );
+        }
         await Future<void>.delayed(Duration.zero);
       }
 
