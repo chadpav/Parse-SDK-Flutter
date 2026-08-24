@@ -217,7 +217,9 @@ void main() {
 
     test('on a lazy (no objectId) anonymous user, setting username drops the '
         'anonymous entry locally without leaving a null marker. unpersisted '
-        'users have nothing to unlink server-side, so no marker is needed', () {
+        'users have nothing to unlink server-side, so no marker is needed — '
+        'and the sign-up request body must not serialize an authData '
+        'leftover either', () async {
       final ParseUser user = ParseUser(null, null, null, client: client);
       user.fromJson(<String, dynamic>{
         keyVarAuthData: <String, dynamic>{
@@ -234,6 +236,48 @@ void main() {
         reason:
             'unpersisted anonymous user should drop the entry without '
             'leaving a null marker',
+      );
+
+      // The behavior the cleanup protects: the lazy user's sign-up POST
+      // must not carry the dropped anonymous entry (or an empty map).
+      final String signUpPath = Uri.parse(
+        '$serverUrl$keyEndPointClasses$keyClassUser',
+      ).toString();
+      when(
+        client.post(
+          signUpPath,
+          options: anyNamed('options'),
+          data: anyNamed('data'),
+        ),
+      ).thenAnswer(
+        (_) async => ParseNetworkResponse(
+          statusCode: 201,
+          data: jsonEncode(<String, dynamic>{
+            keyVarObjectId: 'lazy123',
+            keyVarSessionToken: 'r:lazySession',
+          }),
+        ),
+      );
+
+      final ParseResponse response = await user.signUp(allowWithoutEmail: true);
+      expect(response.success, isTrue);
+
+      final String postedBody =
+          verify(
+                client.post(
+                  signUpPath,
+                  options: anyNamed('options'),
+                  data: captureAnyNamed('data'),
+                ),
+              ).captured.single
+              as String;
+      final Map<String, dynamic> postedJson = json.decode(postedBody);
+      expect(
+        postedJson.containsKey(keyVarAuthData),
+        isFalse,
+        reason:
+            'sign-up body must not serialize authData once the anonymous '
+            'map became empty — not even as an empty object',
       );
     });
   });
