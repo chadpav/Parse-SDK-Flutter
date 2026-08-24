@@ -501,11 +501,14 @@ class ParseUser extends ParseObject implements ParseCloneable {
         // Adopt the response session token only for the current user — a
         // detached instance's freshly-minted token must not replace the
         // global session, or storage and session would belong to two
-        // different accounts.
-        if (await _isCurrentUser()) {
-          _adoptResponseSessionTokenIfChanged(tokenBefore);
-          await _onResponseSuccess();
-        }
+        // different accounts. The check + write run under the persistence
+        // gate so no other persistence can interleave between them.
+        await _serializedPersistence(() async {
+          if (await _isCurrentUser()) {
+            _adoptResponseSessionTokenIfChanged(tokenBefore);
+            await _onResponseSuccess();
+          }
+        });
       }
       return response;
     }
@@ -521,11 +524,13 @@ class ParseUser extends ParseObject implements ParseCloneable {
       if (response.success) {
         _cleanUpAuthData();
         // Same ordering as save(): token adoption is gated on the instance
-        // being the stored current user.
-        if (await _isCurrentUser()) {
-          _adoptResponseSessionTokenIfChanged(tokenBefore);
-          await _onResponseSuccess();
-        }
+        // being the stored current user, atomically under the gate.
+        await _serializedPersistence(() async {
+          if (await _isCurrentUser()) {
+            _adoptResponseSessionTokenIfChanged(tokenBefore);
+            await _onResponseSuccess();
+          }
+        });
       }
       return response;
     }
@@ -546,6 +551,25 @@ class ParseUser extends ParseObject implements ParseCloneable {
 
   Future<void> _onResponseSuccess() async {
     await saveInStorage(keyParseStoreUser);
+  }
+
+  /// Serializes every current-user persistence decision with its write.
+  ///
+  /// [_isCurrentUser]'s storage read and [_onResponseSuccess]'s write are
+  /// separated by awaits; without a lock another persistence operation
+  /// (e.g. a login completing concurrently) can interleave between them, and
+  /// a check that passed against the old stored user would overwrite the
+  /// newer one — the same clobber the gate exists to prevent, in a narrower
+  /// window. Chaining every check+write pair on one static future makes each
+  /// pair atomic relative to the others.
+  static Future<void> _persistenceGate = Future<void>.value();
+
+  static Future<void> _serializedPersistence(Future<void> Function() action) {
+    final Future<void> next = _persistenceGate.then((_) => action());
+    // Keep the chain usable after a failed action; the error still reaches
+    // this call's awaiter through `next`.
+    _persistenceGate = next.then((_) {}, onError: (Object _) {});
+    return next;
   }
 
   /// Whether this instance is the current user stored in local storage.
@@ -729,11 +753,13 @@ class ParseUser extends ParseObject implements ParseCloneable {
       return parseResponse;
     } else {
       final ParseUser user = parseResponse.result;
-      if (_establishesCurrentUser(type) ||
-          user._persistAsCurrentUser ||
-          await user._isCurrentUser()) {
-        await user._onResponseSuccess();
-      }
+      await _serializedPersistence(() async {
+        if (_establishesCurrentUser(type) ||
+            user._persistAsCurrentUser ||
+            await user._isCurrentUser()) {
+          await user._onResponseSuccess();
+        }
+      });
       return parseResponse;
     }
   }

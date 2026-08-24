@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:mockito/mockito.dart';
@@ -487,5 +488,165 @@ void main() {
         },
       );
     }
+
+    test('a login landing while a gated save is mid-check cannot be '
+        'overwritten by the stale write — the current-user check and its '
+        'persist are one serialized operation', () async {
+      final CoreStore realStore = ParseCoreData().getStore();
+      final _HoldingCoreStore holdingStore = _HoldingCoreStore(realStore);
+      ParseCoreData().storage = holdingStore;
+      addTearDown(() => ParseCoreData().storage = realStore);
+
+      await seedCurrentUserInStorage();
+
+      when(
+        client.put(
+          currentPutPath,
+          options: anyNamed('options'),
+          data: anyNamed('data'),
+        ),
+      ).thenAnswer(
+        (_) async => ParseNetworkResponse(
+          statusCode: 200,
+          data: jsonEncode(<String, dynamic>{
+            keyVarUpdatedAt: '2026-08-19T12:00:01.000Z',
+          }),
+        ),
+      );
+
+      final String loginPath = Uri.parse(
+        '$serverUrl$keyEndPointLogin',
+      ).toString();
+      when(
+        client.post(
+          loginPath,
+          options: anyNamed('options'),
+          data: anyNamed('data'),
+        ),
+      ).thenAnswer(
+        (_) async => ParseNetworkResponse(
+          statusCode: 200,
+          data: jsonEncode(<String, dynamic>{
+            keyVarObjectId: 'userCCC',
+            keyVarUsername: 'bob@example.com',
+            keyVarSessionToken: 'r:bobSession',
+          }),
+        ),
+      );
+
+      // The current user's save reaches its gate check first and is held
+      // open mid-read.
+      final ParseUser userA = ParseUser(null, null, null, client: client);
+      userA.fromJson(<String, dynamic>{
+        keyVarObjectId: currentUserObjectId,
+        keyVarSessionToken: 'r:currentSession',
+        keyVarUsername: 'alice@example.com',
+      });
+      userA.set<String>('localeIdentifier', 'en-US');
+
+      holdingStore.arm();
+      final Future<ParseResponse> saveFuture = userA.save();
+      while (!holdingStore.isHolding) {
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      // A login completes while the save's check is suspended. Serialized,
+      // it must queue behind the whole check+write pair — not write in the
+      // middle of it and then be clobbered by the stale gated write.
+      final ParseUser userB = ParseUser(
+        'bob@example.com',
+        'hunter2',
+        null,
+        client: client,
+      );
+      final Future<ParseResponse> loginFuture = userB.login();
+      for (int i = 0; i < 10; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      holdingStore.release();
+      await Future.wait(<Future<ParseResponse>>[saveFuture, loginFuture]);
+
+      expect(await storedUserObjectId(), equals('userCCC'));
+    });
   });
+}
+
+/// One-shot blocking decorator over a [CoreStore]: after [arm], the next
+/// `getString(keyParseStoreUser)` snapshots the stored value immediately,
+/// then suspends until [release] — letting a test force another persistence
+/// operation to run while a check+write critical section is mid-flight.
+class _HoldingCoreStore implements CoreStore {
+  _HoldingCoreStore(this._inner);
+
+  final CoreStore _inner;
+  Completer<void>? _hold;
+  bool _armed = false;
+  bool _holding = false;
+
+  bool get isHolding => _holding;
+
+  void arm() {
+    _armed = true;
+    _hold = Completer<void>();
+  }
+
+  void release() {
+    _holding = false;
+    _hold!.complete();
+  }
+
+  @override
+  Future<String?> getString(String key) async {
+    if (_armed && key == keyParseStoreUser) {
+      _armed = false;
+      final String? snapshot = await _inner.getString(key);
+      _holding = true;
+      await _hold!.future;
+      return snapshot;
+    }
+    return _inner.getString(key);
+  }
+
+  @override
+  Future<bool> containsKey(String key) => _inner.containsKey(key);
+
+  @override
+  Future<dynamic> get(String key) => _inner.get(key);
+
+  @override
+  Future<bool?> getBool(String key) => _inner.getBool(key);
+
+  @override
+  Future<int?> getInt(String key) => _inner.getInt(key);
+
+  @override
+  Future<double?> getDouble(String key) => _inner.getDouble(key);
+
+  @override
+  Future<List<String>?> getStringList(String key) => _inner.getStringList(key);
+
+  @override
+  Future<dynamic> setBool(String key, bool value) => _inner.setBool(key, value);
+
+  @override
+  Future<dynamic> setInt(String key, int value) => _inner.setInt(key, value);
+
+  @override
+  Future<dynamic> setDouble(String key, double value) =>
+      _inner.setDouble(key, value);
+
+  @override
+  Future<dynamic> setString(String key, String value) =>
+      _inner.setString(key, value);
+
+  @override
+  Future<dynamic> setStringList(String key, List<String> values) =>
+      _inner.setStringList(key, values);
+
+  @override
+  Future<dynamic> remove(String key) => _inner.remove(key);
+
+  @override
+  Future<dynamic> clear() => _inner.clear();
 }
