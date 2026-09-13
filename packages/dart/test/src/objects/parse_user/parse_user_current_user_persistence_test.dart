@@ -567,7 +567,21 @@ void main() {
         client: client,
       );
       final Future<ParseResponse> loginFuture = userB.login();
-      for (int i = 0; i < 10; i++) {
+
+      // Deterministic enqueue signal: _handleResponse installs the response
+      // sessionToken via setSessionId and calls _serializedPersistence in the
+      // same synchronous stretch (no await between them). Once the global
+      // session reads the login's token, the login persistence action is
+      // provably queued behind the held save — releasing now exercises the
+      // stale-write interleaving on every scheduler.
+      pumps = 0;
+      while (ParseCoreData().sessionId != 'r:bobSession') {
+        if (++pumps > 1000) {
+          fail(
+            'login() never installed its session token; its persistence '
+            'action was not enqueued behind the held save.',
+          );
+        }
         await Future<void>.delayed(Duration.zero);
       }
 
