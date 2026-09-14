@@ -23,6 +23,14 @@ class ParseInstallation extends ParseObject {
   ];
   static String? _currentInstallationId;
 
+  /// Single source of truth for "is this installationId usable as a header
+  /// value and a request body field". Empty strings and whitespace-only
+  /// strings are rejected; a stale store containing either should fall
+  /// through to UUID regeneration rather than be reused.
+  static bool _isUsableInstallationId(Object? value) {
+    return value is String && value.trim().isNotEmpty;
+  }
+
   //Getters/setters
   Map<String, dynamic> get acl => super.get<Map<String, dynamic>>(
     keyVarAcl,
@@ -53,7 +61,15 @@ class ParseInstallation extends ParseObject {
   String? get parseVersion => super.get<String>(keyParseVersion);
 
   static Future<bool> isCurrent(ParseInstallation installation) async {
-    _currentInstallationId ??= (await _getFromLocalStore())?.installationId;
+    // Treat an empty-string cache as missing. A previously poisoned local
+    // store could populate the cache with "", and `??=` would happily leave
+    // the empty string in place — poisoning every subsequent header and
+    // POST body.
+    if (!_isUsableInstallationId(_currentInstallationId)) {
+      final String? stored = (await _getFromLocalStore())?.installationId;
+      _currentInstallationId =
+          _isUsableInstallationId(stored) ? stored : null;
+    }
     return _currentInstallationId != null &&
         installation.installationId == _currentInstallationId;
   }
@@ -61,6 +77,61 @@ class ParseInstallation extends ParseObject {
   /// Gets the current installation from storage
   static Future<ParseInstallation> currentInstallation() async {
     return (await _getFromLocalStore()) ?? (await _createInstallation());
+  }
+
+  /// Returns the current installation's UUID. Hot path for
+  /// `ParseClient.buildHeaders`, which runs on every HTTP request.
+  ///
+  /// The first call reads `keyInstallationId` directly from the JSON stored
+  /// at [keyParseStoreInstallation] — without going through `fromJson` and
+  /// constructing a full `ParseInstallation` with its dirty-tracking maps.
+  /// Subsequent calls return the value from the static cache in
+  /// [_currentInstallationId]. The install ID is immutable for the lifetime
+  /// of the app on a given device, so the cache never needs invalidation.
+  static Future<String?> currentInstallationId() async {
+    if (_isUsableInstallationId(_currentInstallationId)) {
+      return _currentInstallationId;
+    }
+    final String? stored = await _readInstallationIdFromStore();
+    if (stored != null) {
+      _currentInstallationId = stored;
+      return _currentInstallationId;
+    }
+    // Bootstrap. `_createInstallation` sets `_currentInstallationId` via `??=`
+    // *before* it attempts persistence; if persistence throws we clear the
+    // cache so the next call retries the write. Matches the pre-cache
+    // behaviour of `currentInstallation()`, which would re-enter
+    // `_createInstallation` on every call until storage succeeded.
+    try {
+      await _createInstallation();
+    } catch (_) {
+      _currentInstallationId = null;
+      rethrow;
+    }
+    return _currentInstallationId;
+  }
+
+  /// Clears the cached installation UUID so the next call to
+  /// [currentInstallationId] re-reads from the local store. Intended for tests
+  /// that wipe storage between cases, and for apps that re-initialize Parse or
+  /// clear the core store mid-session.
+  @visibleForTesting
+  static void debugResetInstallationIdCache() {
+    _currentInstallationId = null;
+  }
+
+  /// Reads just the installation UUID out of the locally-stored JSON map,
+  /// avoiding a full `ParseInstallation()..fromJson(...)` round-trip when the
+  /// caller only needs the ID (see [currentInstallationId]).
+  static Future<String?> _readInstallationIdFromStore() async {
+    final String? installationJson = await ParseCoreData()
+        .getStore()
+        .getString(keyParseStoreInstallation);
+    if (installationJson == null) return null;
+    final dynamic decoded = json.decode(installationJson);
+    if (decoded is! Map<String, dynamic>) return null;
+    final dynamic id = decoded[keyInstallationId];
+    return _isUsableInstallationId(id) ? id as String : null;
   }
 
   /// Updates the installation with current device data
@@ -91,6 +162,22 @@ class ParseInstallation extends ParseObject {
     set<String?>(keyAppVersion, ParseCoreData().appVersion);
     set<String?>(keyAppIdentifier, ParseCoreData().appPackageName);
     set<String>(keyParseVersion, keySdkVersion);
+
+    // Re-stage installationId into `_unsavedChanges` so `_create()`'s
+    // `toJson(forApiRQ: true)` body actually carries it. On a subsequent
+    // launch (process died before the first server POST) `_getFromLocalStore`
+    // uses `fromJson(addInUnSave: false)`, which only populates `_objectData`.
+    // Without this gate, the next POST would create a server row with no
+    // `installationId`, breaking any later server-side query that matches by
+    // the UUID the device sends in `X-Parse-Installation-Id`. Gated on
+    // `objectId == null` so the SDK never tries to mutate a read-only field
+    // on an already-server-persisted row.
+    if (objectId == null) {
+      final String? currentId = installationId;
+      if (_isUsableInstallationId(currentId)) {
+        set<String>(keyInstallationId, currentId!);
+      }
+    }
   }
 
   String _getNameLocalTimeZone() {
@@ -147,7 +234,14 @@ class ParseInstallation extends ParseObject {
     return parseResponse;
   }
 
-  /// Gets the locally stored installation
+  /// Gets the locally stored installation.
+  ///
+  /// Returns null if the stored JSON is missing or unusable (no
+  /// installationId, or installationId is the empty string / whitespace /
+  /// wrong type). Callers fall through to [_createInstallation], which
+  /// generates a fresh UUID rather than reusing a poisoned value.
+  /// Centralizing the validity check here keeps corrupted local state from
+  /// leaking into server requests.
   static Future<ParseInstallation?> _getFromLocalStore() async {
     final CoreStore coreStore = ParseCoreData().getStore();
 
@@ -161,6 +255,15 @@ class ParseInstallation extends ParseObject {
       );
 
       if (installationMap != null) {
+        if (!_isUsableInstallationId(installationMap[keyInstallationId])) {
+          if (ParseCoreData().debug) {
+            print(
+              'ParseInstallation: discarding stored installation with '
+              'missing/empty installationId; a new UUID will be minted.',
+            );
+          }
+          return null;
+        }
         return ParseInstallation()..fromJson(installationMap);
       }
     }
@@ -172,7 +275,12 @@ class ParseInstallation extends ParseObject {
   /// Assumes that this is called because there is no previous installation
   /// so it creates and sets the static current installation UUID
   static Future<ParseInstallation> _createInstallation() async {
-    _currentInstallationId ??= const Uuid().v4();
+    // Explicit null-or-empty check. `??=` would leave a cached empty string
+    // in place — that was the bug that wrote `installationId: ""` to the
+    // server and produced rows the device's later UUID could never match.
+    if (!_isUsableInstallationId(_currentInstallationId)) {
+      _currentInstallationId = const Uuid().v4();
+    }
 
     final ParseInstallation installation = ParseInstallation();
     installation._installationId = _currentInstallationId;
